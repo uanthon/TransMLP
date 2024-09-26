@@ -1,5 +1,5 @@
 # TransMLP
-# Optional solution for step 1: install libs step by step
+# Install libs step by step
 conda create -n Transmlp python=3.7 -y
 conda activate Transmlp
 conda install pytorch==1.10.1 torchvision==0.11.2 cudatoolkit=10.2 -c pytorch -y
