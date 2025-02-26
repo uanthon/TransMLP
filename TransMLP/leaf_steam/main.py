@@ -112,6 +112,7 @@ def train(args, io):
     best_acc = 0
     best_class_iou = 0
     best_instance_iou = 0
+    best_f1 = 0  # Track best F1 score
     num_part = 50
     num_classes = 16
 
@@ -155,11 +156,21 @@ def train(args, io):
                 'model': model.module.state_dict() if torch.cuda.device_count() > 1 else model.state_dict(),
                 'optimizer': opt.state_dict(), 'epoch': epoch, 'test_class_iou': best_class_iou}
             torch.save(state, 'checkpoints/%s/best_clsiou_model.pth' % args.exp_name)
+            
+        # 4. When get the best F1 score, save the model
+        if 'f1_score' in test_metrics and test_metrics['f1_score'] > best_f1:
+            best_f1 = test_metrics['f1_score']
+            io.cprint('Max F1 score:%.5f' % best_f1)
+            state = {
+                'model': model.module.state_dict() if torch.cuda.device_count() > 1 else model.state_dict(),
+                'optimizer': opt.state_dict(), 'epoch': epoch, 'test_f1': best_f1}
+            torch.save(state, 'checkpoints/%s/best_f1_model.pth' % args.exp_name)
 
-    # report best acc, ins_iou, cls_iou
+    # report best acc, ins_iou, cls_iou, and F1 score
     io.cprint('Final Max Acc:%.5f' % best_acc)
     io.cprint('Final Max instance iou:%.5f' % best_instance_iou)
     io.cprint('Final Max class iou:%.5f' % best_class_iou)
+    io.cprint('Final Max F1 score:%.5f' % best_f1)
     # save last model
     state = {
         'model': model.module.state_dict() if torch.cuda.device_count() > 1 else model.state_dict(),
@@ -240,6 +251,16 @@ def test_epoch(test_loader, model, epoch, num_part, num_classes, io):
     final_total_per_cat_seen = np.zeros(16).astype(np.int32)
     metrics = defaultdict(lambda: list())
     model.eval()
+    
+    # Initialize arrays for precision, recall metrics
+    total_tp = np.zeros(num_part).astype(np.int64)
+    total_fp = np.zeros(num_part).astype(np.int64)
+    total_fn = np.zeros(num_part).astype(np.int64)
+    
+    # Also track per class metrics
+    per_class_tp = np.zeros(num_part).astype(np.int64)
+    per_class_fp = np.zeros(num_part).astype(np.int64) 
+    per_class_fn = np.zeros(num_part).astype(np.int64)
 
     # label_size: b, means each sample has one corresponding class
     for batch_id, (points, label, target, norm_plt) in tqdm(enumerate(test_loader), total=len(test_loader), smoothing=0.9):
@@ -267,6 +288,7 @@ def test_epoch(test_loader, model, epoch, num_part, num_classes, io):
         # prepare seg_pred and target for later calculating loss and acc:
         seg_pred = seg_pred.contiguous().view(-1, num_part)
         target = target.view(-1, 1)[:, 0]
+        
         # Loss
         loss = F.nll_loss(seg_pred.contiguous(), target.contiguous())
 
@@ -274,11 +296,70 @@ def test_epoch(test_loader, model, epoch, num_part, num_classes, io):
         pred_choice = seg_pred.data.max(1)[1]  # b*n
         correct = pred_choice.eq(target.data).sum()  # torch.int64: total number of correct-predict pts
 
+        # Calculate precision, recall, and F1 metrics
+        pred_choice_np = pred_choice.cpu().numpy()
+        target_np = target.cpu().numpy()
+        
+        # Calculate TP, FP, FN for each class
+        for cls_idx in range(num_part):
+            pred_mask = (pred_choice_np == cls_idx)
+            target_mask = (target_np == cls_idx)
+            
+            tp = np.sum(np.logical_and(pred_mask, target_mask))
+            fp = np.sum(np.logical_and(pred_mask, np.logical_not(target_mask)))
+            fn = np.sum(np.logical_and(np.logical_not(pred_mask), target_mask))
+            
+            total_tp[cls_idx] += tp
+            total_fp[cls_idx] += fp
+            total_fn[cls_idx] += fn
+            
+            per_class_tp[cls_idx] += tp
+            per_class_fp[cls_idx] += fp
+            per_class_fn[cls_idx] += fn
+
         loss = torch.mean(loss)
         shape_ious += batch_ious.item()  # count the sum of ious in each iteration
         count += batch_size  # count the total number of samples in each iteration
         test_loss += loss.item() * batch_size
         accuracy.append(correct.item() / (batch_size * num_point))  # append the accuracy of each iteration
+
+    # Calculate per-class precision, recall, F1
+    class_precision = np.zeros(num_part)
+    class_recall = np.zeros(num_part)
+    class_f1 = np.zeros(num_part)
+    
+    for cls_idx in range(num_part):
+        if per_class_tp[cls_idx] + per_class_fp[cls_idx] > 0:
+            class_precision[cls_idx] = per_class_tp[cls_idx] / (per_class_tp[cls_idx] + per_class_fp[cls_idx])
+        else:
+            class_precision[cls_idx] = 0.0
+            
+        if per_class_tp[cls_idx] + per_class_fn[cls_idx] > 0:
+            class_recall[cls_idx] = per_class_tp[cls_idx] / (per_class_tp[cls_idx] + per_class_fn[cls_idx])
+        else:
+            class_recall[cls_idx] = 0.0
+            
+        if class_precision[cls_idx] + class_recall[cls_idx] > 0:
+            class_f1[cls_idx] = 2 * class_precision[cls_idx] * class_recall[cls_idx] / (class_precision[cls_idx] + class_recall[cls_idx])
+        else:
+            class_f1[cls_idx] = 0.0
+
+    # Calculate overall metrics
+    overall_tp = np.sum(total_tp)
+    overall_fp = np.sum(total_fp)
+    overall_fn = np.sum(total_fn)
+    
+    overall_precision = overall_tp / (overall_tp + overall_fp) if (overall_tp + overall_fp) > 0 else 0.0
+    overall_recall = overall_tp / (overall_tp + overall_fn) if (overall_tp + overall_fn) > 0 else 0.0
+    overall_f1 = 2 * overall_precision * overall_recall / (overall_precision + overall_recall) if (overall_precision + overall_recall) > 0 else 0.0
+    
+    # Store metrics
+    metrics['precision'] = overall_precision
+    metrics['recall'] = overall_recall
+    metrics['f1_score'] = overall_f1
+    metrics['class_precision'] = class_precision
+    metrics['class_recall'] = class_recall
+    metrics['class_f1'] = class_f1
 
     for cat_idx in range(16):
         if final_total_per_cat_seen[cat_idx] > 0:  # indicating this cat is included during previous iou appending
@@ -287,10 +368,17 @@ def test_epoch(test_loader, model, epoch, num_part, num_classes, io):
     metrics['accuracy'] = np.mean(accuracy)
     metrics['shape_avg_iou'] = shape_ious * 1.0 / count
 
-    outstr = 'Test %d, loss: %f, test acc: %f  test ins_iou: %f' % (epoch + 1, test_loss * 1.0 / count,
-                                                                    metrics['accuracy'], metrics['shape_avg_iou'])
+    outstr = 'Test %d, loss: %f, test acc: %f, test ins_iou: %f, precision: %f, recall: %f, F1: %f' % (
+        epoch + 1, test_loss * 1.0 / count, metrics['accuracy'], metrics['shape_avg_iou'],
+        metrics['precision'], metrics['recall'], metrics['f1_score'])
 
     io.cprint(outstr)
+    
+    # Print per-class precision, recall, F1
+    io.cprint('Per-class metrics:')
+    for cls_idx in range(num_part):
+        if per_class_tp[cls_idx] + per_class_fp[cls_idx] + per_class_fn[cls_idx] > 0:  # Only print classes that appear
+            io.cprint(f'Class {cls_idx}: Precision={class_precision[cls_idx]:.4f}, Recall={class_recall[cls_idx]:.4f}, F1={class_f1[cls_idx]:.4f}')
 
     return metrics, final_total_per_cat_iou
 
@@ -327,6 +415,16 @@ def test(args, io):
     shape_ious = []
     total_per_cat_iou = np.zeros((16)).astype(np.float32)
     total_per_cat_seen = np.zeros((16)).astype(np.int32)
+    
+    # Initialize arrays for precision, recall metrics
+    total_tp = np.zeros(num_part).astype(np.int64)
+    total_fp = np.zeros(num_part).astype(np.int64)
+    total_fn = np.zeros(num_part).astype(np.int64)
+    
+    # Also track per class metrics
+    per_class_tp = np.zeros(num_part).astype(np.int64)
+    per_class_fp = np.zeros(num_part).astype(np.int64) 
+    per_class_fn = np.zeros(num_part).astype(np.int64)
 
     for batch_id, (points, label, target, norm_plt) in tqdm(enumerate(test_loader), total=len(test_loader), smoothing=0.9):
         batch_size, num_point, _ = points.size()
@@ -355,10 +453,68 @@ def test(args, io):
         pred_choice = seg_pred.data.max(1)[1]
         correct = pred_choice.eq(target.data).cpu().sum()
         metrics['accuracy'].append(correct.item() / (batch_size * num_point))
+        
+        # Calculate precision, recall, and F1 metrics
+        pred_choice_np = pred_choice.cpu().numpy()
+        target_np = target.cpu().numpy()
+        
+        # Calculate TP, FP, FN for each class
+        for cls_idx in range(num_part):
+            pred_mask = (pred_choice_np == cls_idx)
+            target_mask = (target_np == cls_idx)
+            
+            tp = np.sum(np.logical_and(pred_mask, target_mask))
+            fp = np.sum(np.logical_and(pred_mask, np.logical_not(target_mask)))
+            fn = np.sum(np.logical_and(np.logical_not(pred_mask), target_mask))
+            
+            total_tp[cls_idx] += tp
+            total_fp[cls_idx] += fp
+            total_fn[cls_idx] += fn
+            
+            per_class_tp[cls_idx] += tp
+            per_class_fp[cls_idx] += fp
+            per_class_fn[cls_idx] += fn
+
+    # Calculate per-class precision, recall, F1
+    class_precision = np.zeros(num_part)
+    class_recall = np.zeros(num_part)
+    class_f1 = np.zeros(num_part)
+    
+    for cls_idx in range(num_part):
+        if per_class_tp[cls_idx] + per_class_fp[cls_idx] > 0:
+            class_precision[cls_idx] = per_class_tp[cls_idx] / (per_class_tp[cls_idx] + per_class_fp[cls_idx])
+        else:
+            class_precision[cls_idx] = 0.0
+            
+        if per_class_tp[cls_idx] + per_class_fn[cls_idx] > 0:
+            class_recall[cls_idx] = per_class_tp[cls_idx] / (per_class_tp[cls_idx] + per_class_fn[cls_idx])
+        else:
+            class_recall[cls_idx] = 0.0
+            
+        if class_precision[cls_idx] + class_recall[cls_idx] > 0:
+            class_f1[cls_idx] = 2 * class_precision[cls_idx] * class_recall[cls_idx] / (class_precision[cls_idx] + class_recall[cls_idx])
+        else:
+            class_f1[cls_idx] = 0.0
+
+    # Calculate overall metrics
+    overall_tp = np.sum(total_tp)
+    overall_fp = np.sum(total_fp)
+    overall_fn = np.sum(total_fn)
+    
+    overall_precision = overall_tp / (overall_tp + overall_fp) if (overall_tp + overall_fp) > 0 else 0.0
+    overall_recall = overall_tp / (overall_tp + overall_fn) if (overall_tp + overall_fn) > 0 else 0.0
+    overall_f1 = 2 * overall_precision * overall_recall / (overall_precision + overall_recall) if (overall_precision + overall_recall) > 0 else 0.0
 
     hist_acc += metrics['accuracy']
     metrics['accuracy'] = np.mean(hist_acc)
     metrics['shape_avg_iou'] = np.mean(shape_ious)
+    metrics['precision'] = overall_precision
+    metrics['recall'] = overall_recall
+    metrics['f1_score'] = overall_f1
+    metrics['class_precision'] = class_precision
+    metrics['class_recall'] = class_recall
+    metrics['class_f1'] = class_f1
+    
     for cat_idx in range(16):
         if total_per_cat_seen[cat_idx] > 0:
             total_per_cat_iou[cat_idx] = total_per_cat_iou[cat_idx] / total_per_cat_seen[cat_idx]
@@ -369,8 +525,17 @@ def test(args, io):
         class_iou += total_per_cat_iou[cat_idx]
         io.cprint(classes_str[cat_idx] + ' iou: ' + str(total_per_cat_iou[cat_idx]))  # print the iou of each class
     avg_class_iou = class_iou / 16
-    outstr = 'Test :: test acc: %f  test class mIOU: %f, test instance mIOU: %f' % (metrics['accuracy'], avg_class_iou, metrics['shape_avg_iou'])
+    
+    outstr = 'Test :: test acc: %f, test class mIOU: %f, test instance mIOU: %f, precision: %f, recall: %f, F1: %f' % (
+        metrics['accuracy'], avg_class_iou, metrics['shape_avg_iou'], 
+        metrics['precision'], metrics['recall'], metrics['f1_score'])
     io.cprint(outstr)
+    
+    # Print per-class precision, recall, F1
+    io.cprint('Per-class metrics:')
+    for cls_idx in range(num_part):
+        if per_class_tp[cls_idx] + per_class_fp[cls_idx] + per_class_fn[cls_idx] > 0:  # Only print classes that appear
+            io.cprint(f'Class {cls_idx}: Precision={class_precision[cls_idx]:.4f}, Recall={class_recall[cls_idx]:.4f}, F1={class_f1[cls_idx]:.4f}')
 
 
 if __name__ == "__main__":
@@ -407,7 +572,7 @@ if __name__ == "__main__":
     parser.add_argument('--resume', type=bool, default=False,
                         help='Resume training or not')
     parser.add_argument('--model_type', type=str, default='insiou',
-                        help='choose to test the best insiou/clsiou/acc model (options: insiou, clsiou, acc)')
+                        help='choose to test the best insiou/clsiou/acc/f1 model (options: insiou, clsiou, acc, f1)')
 
     args = parser.parse_args()
     args.exp_name = args.model+"_"+args.exp_name
